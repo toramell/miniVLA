@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Conda
+.env
+.venv
+conda
+*.lock
+
+# Checkpoints / Logs
+*.pt
+*.pth
+*.ckpt
+logs/
+wandb/
+outputs/
+
+# Datasets
+data/
+datasets/
+LIBERO/
+ucf101/
+cache/
+
+# OS
+.DS_Store
