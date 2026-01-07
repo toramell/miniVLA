@@ -3,7 +3,8 @@ libero_dataset.py
 
 LIBERO HDF5データセットのためのPyTorch Datasetクラス
 - HDF5形式のロボットデモンストレーションを読み込み
-- 画像（agentview）と言語指示、7次元アクションを返す
+- 画像（agentview）と言語指示
+- アクションを修正（3D回転 -> 6D回転）して返す
 """
 import os
 import h5py
@@ -14,14 +15,13 @@ from torch.utils.data import Dataset
 from pathlib import Path
 from typing import List, Dict, Tuple
 
+# 作成したrotation_utilsから関数をインポート
+from rotation_utils import euler_to_rot6d
+
 
 class LIBERODataset(Dataset):
     """
     LIBERO HDF5データセットからロボットデモンストレーションを読み込む
-    
-    Args:
-        data_dir: LIBERO HDF5ファイルが格納されているディレクトリ
-        transform: 画像に適用する変換（オプション）
     """
     def __init__(self, data_dir: str, transform=None):
         self.data_dir = Path(data_dir)
@@ -52,10 +52,9 @@ class LIBERODataset(Dataset):
                     
                     # 観測データを取得
                     if 'obs' in demo:
-                        # 新しいフォーマット（regenerateされたデータ）
+                        # Agentviewの画像を使用
                         images = demo['obs']['agentview_rgb'][()]
                     else:
-                        # オリジナルフォーマット
                         images = demo['agentview_image'][()]
                     
                     actions = demo['actions'][()]
@@ -71,9 +70,7 @@ class LIBERODataset(Dataset):
     
     def _task_name_to_description(self, task_name: str) -> str:
         """タスク名を自然言語の指示に変換"""
-        # アンダースコアをスペースに置換
-        description = task_name.replace("_", " ")
-        return description
+        return task_name.replace("_", " ")
     
     def __len__(self) -> int:
         return len(self.samples)
@@ -81,37 +78,61 @@ class LIBERODataset(Dataset):
     def __getitem__(self, idx: int) -> Dict:
         sample = self.samples[idx]
         
-        # 画像を処理
+        # --- 画像処理 ---
         image = sample['image']
         if isinstance(image, np.ndarray):
-            # NumPy配列からPIL Imageに変換
             if image.dtype != np.uint8:
                 image = (image * 255).astype(np.uint8)
             image = Image.fromarray(image)
         
-        # 画像変換を適用
         if self.transform is not None:
             image = self.transform(image)
         
-        # アクションを取得（7次元: x, y, z, roll, pitch, yaw, gripper）
-        action = torch.from_numpy(sample['action'].astype(np.float32))
+        # --- アクション処理 (ここを修正) ---
+        raw_action = sample['action']
         
+        # エラー修正: すでにTensorの場合の対策
+        if isinstance(raw_action, torch.Tensor):
+            action_tensor = raw_action.float()
+        else:
+            action_tensor = torch.from_numpy(raw_action).float()
+
+        # 分解: [x, y, z, roll, pitch, yaw, gripper]
+        pos = action_tensor[:3]      # 位置 (3)
+        euler = action_tensor[3:6]   # 回転 (3)
+        gripper = action_tensor[6:]  # グリッパー (1)
+
+        # 回転を Euler(3) -> 6D(6) に変換
+        # euler_to_rot6d は (B, 3) を期待するので次元を追加して戻す
+        rot6d = euler_to_rot6d(euler.unsqueeze(0)).squeeze(0) # (6,)
+
+        # 新しいアクションベクトル: [pos(3), rot6d(6), gripper(1)] = 10次元
+        new_action = torch.cat([pos, rot6d, gripper], dim=0)
+
+        # --- テキスト処理 ---
+        instruction = sample['instruction']
+        task_name = sample['task_name']
+
+        # キー名は train_libero.py で期待されるものに合わせる ('images' 複数形など)
         return {
-            'image': image,
-            'action': action,
-            'instruction': sample['instruction'],
-            'task_name': sample['task_name']
+            'images': image,
+            'actions': new_action,  # 10次元アクション
+            'instructions': instruction,
+            'task_names': task_name
         }
 
 
 def libero_collate_fn(batch: List[Dict]) -> Dict:
     """
-    LIBEROデータセット用のcollate関数
+    DataLoader用の結合関数
     """
-    images = torch.stack([item['image'] for item in batch])
-    actions = torch.stack([item['action'] for item in batch])
-    instructions = [item['instruction'] for item in batch]
-    task_names = [item['task_name'] for item in batch]
+    # Tensorはスタックする
+    images = torch.stack([item['images'] for item in batch])
+    actions = torch.stack([item['actions'] for item in batch])
+    
+    # 文字列はリストにする
+    instructions = [item['instructions'] for item in batch]
+    task_names = [item['task_names'] for item in batch]
     
     return {
         'images': images,
@@ -122,25 +143,24 @@ def libero_collate_fn(batch: List[Dict]) -> Dict:
 
 
 if __name__ == "__main__":
-    # テスト
+    # 動作確認用
     from torchvision import transforms
     
-    # 画像変換
     transform = transforms.Compose([
-        transforms.Resize((128, 128)),
+        transforms.Resize((224, 224)),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # データセットをロード
+    # パスは環境に合わせて書き換えてください
     data_dir = "/home/toramoto/toramoto/vla/LIBERO/libero/datasets/libero_spatial"
-    dataset = LIBERODataset(data_dir, transform=transform)
     
-    print(f"Dataset size: {len(dataset)}")
-    
-    # 最初のサンプルを確認
-    sample = dataset[0]
-    print(f"Image shape: {sample['image'].shape}")
-    print(f"Action shape: {sample['action'].shape}")
-    print(f"Instruction: {sample['instruction']}")
-    print(f"Action: {sample['action']}")
+    if os.path.exists(data_dir):
+        dataset = LIBERODataset(data_dir, transform=transform)
+        print(f"Dataset size: {len(dataset)}")
+        
+        sample = dataset[0]
+        print(f"Image shape: {sample['images'].shape}")
+        print(f"Action shape: {sample['actions'].shape}") # 10次元になっているはず
+        print(f"Instruction: {sample['instructions']}")
+    else:
+        print("Data directory not found.")

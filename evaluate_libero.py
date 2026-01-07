@@ -5,6 +5,7 @@ evaluate_libero.py
 - タスク別の性能分析
 - アクション次元ごとの誤差分析
 - 予測結果の可視化
+- WandBへの結果アップロード（オプション）
 """
 import os
 import torch
@@ -15,16 +16,24 @@ from torchvision import transforms
 from tqdm import tqdm
 import argparse
 from collections import defaultdict
+from sklearn.metrics import r2_score, accuracy_score
 
+# モデル定義ファイルのインポート（パスが通っていることを前提）
 from vla_robot_policy import VLARobotPolicy
 from libero_dataset import LIBERODataset, libero_collate_fn
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 
 class LIBEROEvaluator:
     """LIBERO用の評価クラス"""
-    def __init__(self, model, device):
+    def __init__(self, model, device, tokenizer):
         self.model = model
         self.device = device
+        self.tokenizer = tokenizer
         self.model.eval()
         
         # アクション次元の名前
@@ -32,14 +41,12 @@ class LIBEROEvaluator:
     
     def evaluate_detailed(self, dataloader):
         """詳細な評価"""
-        # タスク別の結果を保存
         task_results = defaultdict(lambda: {
             'predictions': [],
             'ground_truths': [],
             'errors': []
         })
         
-        # 全体の結果
         all_predictions = []
         all_ground_truths = []
         
@@ -51,11 +58,35 @@ class LIBEROEvaluator:
                 instructions = batch['instructions']
                 task_names = batch['task_names']
                 
-                # 予測
-                actions_pred = self.model(images, instructions)
+                # --- トークン化処理（学習時と同じロジック） ---
+                tokenized = self.tokenizer(
+                    instructions, 
+                    padding=True, 
+                    truncation=True, 
+                    return_tensors="pt"
+                ).to(self.device)
                 
-                # CPUに移動
-                actions_pred_np = actions_pred.cpu().numpy()
+                # 予測
+                actions_pred = self.model(
+                    images, 
+                    tokenized.input_ids, 
+                    tokenized.attention_mask
+                )
+
+                # 1. アーム部分 (-1~1) はそのまま
+                arm_pred = actions_pred[:, :6]
+                
+                # 2. グリッパー部分 (Logits) を Sigmoid で 0~1 にし、さらに -1 or 1 に変換
+                gripper_logits = actions_pred[:, 6:]
+                gripper_prob = torch.sigmoid(gripper_logits)
+                # 確率 > 0.5 なら 1 (閉じる), それ以外なら -1 (開く)
+                gripper_action = torch.where(gripper_prob > 0.5, torch.tensor(1.0).to(self.device), torch.tensor(-1.0).to(self.device))
+                
+                # 3. 結合して元の形に戻す
+                actions_pred_final = torch.cat([arm_pred, gripper_action], dim=-1)
+                
+                # CPUに移動 (actions_pred ではなく actions_pred_final を使う)
+                actions_pred_np = actions_pred_final.cpu().numpy()
                 actions_gt_np = actions_gt.cpu().numpy()
                 
                 # タスク別に結果を保存
@@ -73,7 +104,6 @@ class LIBEROEvaluator:
         all_predictions = np.vstack(all_predictions)
         all_ground_truths = np.vstack(all_ground_truths)
         
-        # タスク別の結果を配列に変換
         for task_name in task_results:
             task_results[task_name]['predictions'] = np.array(task_results[task_name]['predictions'])
             task_results[task_name]['ground_truths'] = np.array(task_results[task_name]['ground_truths'])
@@ -83,23 +113,32 @@ class LIBEROEvaluator:
     
     def compute_metrics(self, predictions, ground_truths):
         """メトリクスを計算"""
-        # MSE
         mse = np.mean((predictions - ground_truths) ** 2)
-        
-        # MAE
         mae = np.mean(np.abs(predictions - ground_truths))
+        rmse = np.sqrt(mse)
         
-        # 各アクション次元ごとのMAE
+        # 各次元ごとのMAE
         mae_per_dim = np.mean(np.abs(predictions - ground_truths), axis=0)
         
-        # RMSE
-        rmse = np.sqrt(mse)
+        # 決定係数 (R2 Score) - 1に近いほど予測が完璧
+        r2_per_dim = []
+        for i in range(7):
+            r2 = r2_score(ground_truths[:, i], predictions[:, i])
+            r2_per_dim.append(r2)
+            
+        # グリッパーの正解率（二値化して判定: 0以上なら閉、未満なら開など）
+        # LIBEROのグリッパー値域によりますが、ここでは正負の符号が一致しているかで簡易判定
+        gripper_pred_binary = (predictions[:, 6] > 0).astype(int)
+        gripper_gt_binary = (ground_truths[:, 6] > 0).astype(int)
+        gripper_accuracy = accuracy_score(gripper_gt_binary, gripper_pred_binary)
         
         return {
             'mse': mse,
             'mae': mae,
             'rmse': rmse,
-            'mae_per_dim': mae_per_dim
+            'mae_per_dim': mae_per_dim,
+            'r2_per_dim': r2_per_dim,
+            'gripper_accuracy': gripper_accuracy
         }
     
     def print_results(self, metrics, task_results=None):
@@ -110,90 +149,83 @@ class LIBEROEvaluator:
         print(f"MSE:  {metrics['mse']:.4f}")
         print(f"MAE:  {metrics['mae']:.4f}")
         print(f"RMSE: {metrics['rmse']:.4f}")
-        print("\nMAE per action dimension:")
+        print(f"Gripper Accuracy: {metrics['gripper_accuracy']:.2%}")
+        
+        print("\nPer-Dimension Metrics:")
+        print(f"{'Dim':<10} {'MAE':<10} {'R2 Score':<10}")
+        print("-" * 30)
         for i, name in enumerate(self.action_names):
-            print(f"  {name:8s}: {metrics['mae_per_dim'][i]:.4f}")
+            print(f"{name:<10} {metrics['mae_per_dim'][i]:.4f}     {metrics['r2_per_dim'][i]:.4f}")
         
         if task_results:
             print("\n" + "="*60)
-            print("Per-Task Results")
+            print("Per-Task Results (Top 5 Worst MAE)")
             print("="*60)
-            for task_name, results in task_results.items():
-                task_metrics = self.compute_metrics(
-                    results['predictions'],
-                    results['ground_truths']
-                )
-                print(f"\n{task_name}:")
-                print(f"  Samples: {len(results['predictions'])}")
-                print(f"  MAE: {task_metrics['mae']:.4f}")
-                print(f"  RMSE: {task_metrics['rmse']:.4f}")
-    
-    def plot_error_distribution(self, predictions, ground_truths, save_path='error_distribution.png'):
-        """誤差の分布を可視化"""
-        errors = np.abs(predictions - ground_truths)
-        
-        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
-        axes = axes.flatten()
-        
-        for i, name in enumerate(self.action_names):
-            ax = axes[i]
-            ax.hist(errors[:, i], bins=50, alpha=0.7, edgecolor='black')
-            ax.set_title(f'{name} - MAE: {np.mean(errors[:, i]):.4f}')
-            ax.set_xlabel('Absolute Error')
-            ax.set_ylabel('Frequency')
-            ax.grid(True, alpha=0.3)
-        
-        # 全体のMAE
-        axes[7].axis('off')
-        overall_mae = np.mean(errors)
-        axes[7].text(0.5, 0.5, f'Overall MAE:\n{overall_mae:.4f}', 
-                    ha='center', va='center', fontsize=20, weight='bold')
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        print(f"\nError distribution plot saved to {save_path}")
-        plt.close()
-    
-    def plot_prediction_vs_gt(self, predictions, ground_truths, save_path='prediction_vs_gt.png', num_samples=1000):
-        """予測値 vs 真値の散布図"""
-        # サンプル数を制限
+            # MAEが悪い順にソート
+            sorted_tasks = sorted(
+                task_results.items(),
+                key=lambda x: np.mean(x[1]['errors']),
+                reverse=True
+            )
+            
+            for task_name, results in sorted_tasks[:5]:
+                task_mae = np.mean(results['errors'])
+                print(f"{task_name}: MAE = {task_mae:.4f}")
+
+    def plot_prediction_vs_gt(self, predictions, ground_truths, save_path='prediction_vs_gt.png', num_samples=2000):
+        """予測値 vs 真値の散布図（改良版）"""
         if len(predictions) > num_samples:
             indices = np.random.choice(len(predictions), num_samples, replace=False)
             predictions = predictions[indices]
             ground_truths = ground_truths[indices]
         
-        fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+        fig, axes = plt.subplots(2, 4, figsize=(20, 10))
         axes = axes.flatten()
         
         for i, name in enumerate(self.action_names):
             ax = axes[i]
-            ax.scatter(ground_truths[:, i], predictions[:, i], alpha=0.3, s=10)
+            # 散布図
+            ax.scatter(ground_truths[:, i], predictions[:, i], alpha=0.2, s=5, color='blue')
             
-            # 理想的な予測線（y=x）
+            # 理想線 (y=x)
             min_val = min(ground_truths[:, i].min(), predictions[:, i].min())
             max_val = max(ground_truths[:, i].max(), predictions[:, i].max())
-            ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
+            ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=1.5, label='Ideal')
             
-            ax.set_title(f'{name}')
+            ax.set_title(f'{name}', fontsize=12, fontweight='bold')
             ax.set_xlabel('Ground Truth')
             ax.set_ylabel('Prediction')
             ax.grid(True, alpha=0.3)
             
-            # 相関係数
-            corr = np.corrcoef(ground_truths[:, i], predictions[:, i])[0, 1]
-            ax.text(0.05, 0.95, f'Corr: {corr:.3f}', 
-                   transform=ax.transAxes, va='top')
-        
+            # 軸の範囲を揃える
+            margin = (max_val - min_val) * 0.1
+            ax.set_xlim(min_val - margin, max_val + margin)
+            ax.set_ylim(min_val - margin, max_val + margin)
+            
         axes[7].axis('off')
         
+        # 全体の情報を表示
+        info_text = (
+            f"Overall MSE: {np.mean((predictions - ground_truths)**2):.4f}\n"
+            f"Overall MAE: {np.mean(np.abs(predictions - ground_truths)):.4f}"
+        )
+        axes[7].text(0.1, 0.5, info_text, fontsize=14, bbox=dict(facecolor='white', alpha=0.8))
+        
         plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.savefig(save_path, dpi=150)
         print(f"Prediction vs GT plot saved to {save_path}")
         plt.close()
+        
+        # WandBへのアップロード
+        if wandb.run is not None:
+            wandb.log({"prediction_vs_gt": wandb.Image(save_path)})
 
 
 def main(args):
-    # デバイス設定
+    # WandB初期化（オプション）
+    if args.use_wandb and wandb:
+        wandb.init(project="vla-libero-eval", name="evaluation_run")
+    
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Using device: {device}")
     
@@ -204,11 +236,10 @@ def main(args):
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
     
-    # データセットをロード
     print(f"Loading LIBERO dataset from {args.data_dir}")
     dataset = LIBERODataset(args.data_dir, transform=transform)
     
-    # DataLoader
+    # 評価用なのでShuffle=False
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -218,96 +249,65 @@ def main(args):
         pin_memory=True
     )
     
-    # モデルをロード
     print(f"Loading VLA model from {args.checkpoint}")
-    
-    # チェックポイントをロード
     checkpoint = torch.load(args.checkpoint, map_location='cpu')
     
-    # モデルを初期化
+    # モデルの初期化
     model = VLARobotPolicy(
-        pretrained_checkpoint=None,  # 重みは後でロード
+        pretrained_checkpoint=None,
         freeze_vision=False,
-        freeze_llm=True,
-        action_dim=7
+        freeze_llm=True
     )
     
-    # 学習済み重みをロード
-    if 'model_state_dict' in checkpoint:
-        model.load_state_dict(checkpoint['model_state_dict'])
-    else:
-        model.load_state_dict(checkpoint)
-    
+    # DataParallelで保存されたモデル（module.xxx）のキーを修正してロード
+    state_dict = checkpoint['model_state_dict'] if 'model_state_dict' in checkpoint else checkpoint
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # まず torch.compile の接頭辞を削除
+        if k.startswith('_orig_mod.'):
+            k = k[10:]  # '_orig_mod.' は10文字
+            
+        # 次に DataParallel の接頭辞を削除
+        if k.startswith('module.'):
+            k = k[7:]   # 'module.' は7文字
+            
+        new_state_dict[k] = v
+            
+    model.load_state_dict(new_state_dict)
     model.to(device)
     model.eval()
     
-    print(f"Model loaded successfully")
-    print(f"Checkpoint info:")
-    if 'epoch' in checkpoint:
-        print(f"  Epoch: {checkpoint['epoch']}")
-    if 'best_loss' in checkpoint:
-        print(f"  Best Loss: {checkpoint['best_loss']:.4f}")
+    print("Model loaded successfully.")
     
-    # 評価
-    evaluator = LIBEROEvaluator(model, device)
+    # 評価実行
+    # モデルからトークナイザーを取得してEvaluatorに渡す
+    evaluator = LIBEROEvaluator(model, device, model.tokenizer)
     predictions, ground_truths, task_results = evaluator.evaluate_detailed(dataloader)
     
-    # メトリクス計算
     metrics = evaluator.compute_metrics(predictions, ground_truths)
-    
-    # 結果表示
     evaluator.print_results(metrics, task_results if args.per_task else None)
     
-    # 可視化
+    # WandBにメトリクスを送信
+    if args.use_wandb and wandb:
+        wandb.log(metrics)
+    
     if args.plot:
-        evaluator.plot_error_distribution(
-            predictions, ground_truths, 
-            save_path=args.output_dir + '/error_distribution.png'
-        )
+        if not os.path.exists(args.output_dir):
+            os.makedirs(args.output_dir)
         evaluator.plot_prediction_vs_gt(
             predictions, ground_truths,
-            save_path=args.output_dir + '/prediction_vs_gt.png'
+            save_path=os.path.join(args.output_dir, 'prediction_vs_gt.png')
         )
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluate VLA on LIBERO dataset")
-    
-    parser.add_argument(
-        "--checkpoint",
-        type=str,
-        default="libero_best_loss_0.2217.pt",
-        help="Path to trained model checkpoint"
-    )
-    parser.add_argument(
-        "--data_dir",
-        type=str,
-        default="/home/toramoto/toramoto/vla/LIBERO/libero/datasets/libero_spatial",
-        help="Path to LIBERO dataset directory"
-    )
-    parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=64,
-        help="Batch size for evaluation"
-    )
-    parser.add_argument(
-        "--per_task",
-        action="store_true",
-        help="Show per-task results"
-    )
-    parser.add_argument(
-        "--plot",
-        action="store_true",
-        help="Generate visualization plots"
-    )
-    parser.add_argument(
-        "--output_dir",
-        type=str,
-        default=".",
-        help="Directory to save plots"
-    )
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to checkpoint")
+    parser.add_argument("--data_dir", type=str, required=True, help="Path to dataset")
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--per_task", action="store_true", help="Show results per task")
+    parser.add_argument("--plot", action="store_true", help="Generate plots")
+    parser.add_argument("--output_dir", type=str, default="results")
+    parser.add_argument("--use_wandb", action="store_true", help="Log results to WandB")
     
     args = parser.parse_args()
-    
     main(args)
